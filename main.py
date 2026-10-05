@@ -19,6 +19,7 @@ ADMIN_ID  = int(os.getenv("ADMIN_ID", "0") or "0")
 PORT      = int(os.getenv("PORT", "10000"))
 
 AXIONNA_API_KEY            = os.getenv("AXIONNA_API_KEY", "")
+AXIONNA_WEBHOOK_SECRET     = os.getenv("AXIONNA_WEBHOOK_SECRET", "")
 DARKBOOST_API_KEY          = os.getenv("DARKBOOST_API_KEY", "")
 DARKBOOST_WEBHOOK_SECRET   = os.getenv("DARKBOOST_WEBHOOK_SECRET", "")
 
@@ -77,6 +78,7 @@ async def fetch_axionna(user_id):
 
 
 async def check_axionna(user_id, task_ids):
+    """Засчитывает ТОЛЬКО по status == 'ok'. Поля 'credited' в API НЕТ."""
     if not AXIONNA_API_KEY or not task_ids: return {}
     s = await http()
     try:
@@ -92,12 +94,12 @@ async def check_axionna(user_id, task_ids):
             res = {}
             for x in d.get("results", []):
                 tid = str(x.get("id"))
-                ok = bool(x.get("subscribed")) and bool(x.get("credited"))
+                st = x.get("status")
+                ok = (st == "ok")
                 res[tid] = {
                     "ok": ok,
-                    "status": x.get("status"),
+                    "status": st,
                     "subscribed": x.get("subscribed"),
-                    "credited": x.get("credited"),
                     "reward": x.get("reward"),
                     "error": x.get("error"),
                 }
@@ -159,19 +161,17 @@ async def check_darkboost(user_id, session_id):
             body = await r.text()
             logging.info(f"DARKBOOST /check: status={r.status}, body={body[:500]}")
             if r.status != 200: return {}
-            d = json.loads(body)
-            return d
+            return json.loads(body)
     except Exception as e:
         logging.error(f"DarkBoost check: {e}")
     return {}
 
 
 # ═══════════════════════════════════════════════
-# WEBHOOK DARKBOOST
+# ВЕБХУК: DARKBOOST (HMAC-SHA256)
 # ═══════════════════════════════════════════════
 
 async def darkboost_webhook(request):
-    """Принимает вебхуки от DarkBoost: subscription / unsubscription."""
     try:
         body = await request.read()
         sig = request.headers.get("X-DarkBoost-Signature", "")
@@ -181,17 +181,16 @@ async def darkboost_webhook(request):
         logging.info(f"DarkBoost webhook: event={event_type}, id={event_id}")
         logging.info(f"DarkBoost webhook body: {body[:500]}")
 
-        # Проверка подписи HMAC-SHA256
         if DARKBOOST_WEBHOOK_SECRET:
             expected = "sha256=" + hmac.new(
                 DARKBOOST_WEBHOOK_SECRET.encode(), body, hashlib.sha256
             ).hexdigest()
             if not hmac.compare_digest(sig, expected):
-                logging.error(f"DarkBoost webhook: bad signature. got={sig[:20]}..., expected={expected[:20]}...")
+                logging.error(f"DarkBoost webhook: bad signature")
                 return web.Response(status=403, text="bad signature")
             logging.info("DarkBoost webhook: signature OK")
         else:
-            logging.warning("DarkBoost webhook: DARKBOOST_WEBHOOK_SECRET не задан, подпись не проверяется")
+            logging.warning("DarkBoost: DARKBOOST_WEBHOOK_SECRET не задан")
 
         try:
             event = json.loads(body)
@@ -204,22 +203,59 @@ async def darkboost_webhook(request):
         service = event.get("service", "darkboost")
 
         if event_type == "subscription" and user_id:
-            logging.info(f"✅ DarkBoost: SUBSCRIPTION для {user_id} (service={service})")
-            # В тестовом боте — просто логируем
-
+            logging.info(f"✅ DarkBoost SUBSCRIPTION: user={user_id}, service={service}")
         elif event_type == "unsubscription" and user_id:
-            logging.info(f"❌ DarkBoost: UNSUBSCRIPTION для {user_id} (service={service})")
+            logging.info(f"❌ DarkBoost UNSUBSCRIPTION: user={user_id}, service={service}")
 
         return web.Response(status=200, text="ok")
-
     except Exception as e:
         logging.error(f"DarkBoost webhook error: {e}")
         return web.Response(status=200, text="ok")
 
 
 async def darkboost_health(request):
-    """GET-проверка, что эндпоинт живой."""
     return web.Response(text="darkboost webhook alive")
+
+
+# ═══════════════════════════════════════════════
+# ВЕБХУК: AXIONNA (X-Axionna-Webhook-Secret)
+# ═══════════════════════════════════════════════
+
+async def axionna_webhook(request):
+    try:
+        body = await request.read()
+        secret = request.headers.get("X-Axionna-Webhook-Secret", "")
+        idem = request.headers.get("Idempotency-Key", "")
+
+        logging.info(f"Axionna webhook: idem={idem}")
+        logging.info(f"Axionna webhook body: {body[:500]}")
+
+        if AXIONNA_WEBHOOK_SECRET and not hmac.compare_digest(secret, AXIONNA_WEBHOOK_SECRET):
+            logging.error("Axionna webhook: bad secret")
+            return web.Response(status=403, text="bad secret")
+
+        try:
+            event = json.loads(body)
+        except Exception:
+            event = {}
+
+        logging.info(f"Axionna payload: {event}")
+
+        ev = event.get("event")
+        user_id = event.get("tg_user_id")
+        chat_id = event.get("chat_id")
+
+        if ev == "subscriber.unsubscribed" and user_id:
+            logging.info(f"❌ Axionna UNSUBSCRIBE: user={user_id}, chat={chat_id}")
+
+        return web.Response(status=200, text="ok")
+    except Exception as e:
+        logging.error(f"Axionna webhook error: {e}")
+        return web.Response(status=200, text="ok")
+
+
+async def axionna_health(request):
+    return web.Response(text="axionna webhook alive")
 
 
 # ═══════════════════════════════════════════════
@@ -313,7 +349,7 @@ async def cb_check(cq: types.CallbackQuery):
             else:
                 report += (
                     f"• <code>{t['id']}</code> — ❌ "
-                    f"sub={info.get('subscribed')}, cred={info.get('credited')}"
+                    f"status={info.get('status')}"
                     f"{', err=' + str(info.get('error')) if info.get('error') else ''}\n"
                 )
         report += f"Итого: <b>{done}/{len(axionna_tasks)}</b>\n\n"
@@ -355,7 +391,8 @@ async def cb_check(cq: types.CallbackQuery):
 async def cmd_admin(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
     text = "🔑 <b>Ключи:</b>\n\n"
-    text += f"{'✅' if AXIONNA_API_KEY else '❌'} Axionna\n"
+    text += f"{'✅' if AXIONNA_API_KEY else '❌'} Axionna API\n"
+    text += f"{'✅' if AXIONNA_WEBHOOK_SECRET else '❌'} Axionna Webhook Secret\n"
     text += f"{'✅' if DARKBOOST_API_KEY else '❌'} DarkBoost API\n"
     text += f"{'✅' if DARKBOOST_WEBHOOK_SECRET else '❌'} DarkBoost Webhook Secret\n"
     await msg.answer(text)
@@ -364,10 +401,12 @@ async def cmd_admin(msg: types.Message):
 @dp.message(Command("webhook_test"))
 async def cmd_webhook_test(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
+    base = os.getenv("SELF_URL", "https://bot-1791164325-1596-ott08319.bothost.tech")
     await msg.answer(
-        f"🔗 URL вебхука:\n"
-        f"<code>https://{os.getenv('SELF_URL', 'твой-домен.bothost.tech')}/darkboost/webhook</code>\n\n"
-        f"Проверь его в браузере — должно быть <b>darkboost webhook alive</b>"
+        f"🔗 <b>Эндпоинты вебхуков:</b>\n\n"
+        f"<b>Axionna:</b>\n<code>{base}/webhook/axionna</code>\n\n"
+        f"<b>DarkBoost:</b>\n<code>{base}/darkboost/webhook</code>\n\n"
+        f"Открой в браузере — оба должны вернуть <b>... alive</b>."
     )
 
 
@@ -382,13 +421,17 @@ async def health(_):
 async def start_web():
     app = web.Application()
     app.router.add_get("/", health)
+    # DarkBoost
     app.router.add_post("/darkboost/webhook", darkboost_webhook)
     app.router.add_get("/darkboost/webhook", darkboost_health)
+    # Axionna
+    app.router.add_post("/webhook/axionna", axionna_webhook)
+    app.router.add_get("/webhook/axionna", axionna_health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     logging.info(f"Web on :{PORT}")
-    logging.info(f"Webhook endpoint: /darkboost/webhook")
+    logging.info(f"Endpoints: /webhook/axionna, /darkboost/webhook")
 
 
 async def on_shutdown(*args, **kwargs):
