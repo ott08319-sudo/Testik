@@ -3,6 +3,8 @@ import time
 import asyncio
 import logging
 import json
+import hmac
+import hashlib
 import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
@@ -16,8 +18,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID  = int(os.getenv("ADMIN_ID", "0") or "0")
 PORT      = int(os.getenv("PORT", "10000"))
 
-AXIONNA_API_KEY   = os.getenv("AXIONNA_API_KEY", "")
-DARKBOOST_API_KEY = os.getenv("DARKBOOST_API_KEY", "")
+AXIONNA_API_KEY            = os.getenv("AXIONNA_API_KEY", "")
+DARKBOOST_API_KEY          = os.getenv("DARKBOOST_API_KEY", "")
+DARKBOOST_WEBHOOK_SECRET   = os.getenv("DARKBOOST_WEBHOOK_SECRET", "")
 
 MAX_SPONSORS = 20
 
@@ -25,7 +28,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 _http = None
-_user_tasks = {}  # {user_id: [{"service","id","link","signature"}]}
+_user_tasks = {}
 
 
 async def http():
@@ -49,18 +52,13 @@ async def fetch_axionna(user_id):
                      "Content-Type": "application/json"}) as r:
             body = await r.text()
             logging.info(f"AXIONNA /sponsors: status={r.status}, body={body[:500]}")
-
-            if r.status != 200:
-                return []
-
+            if r.status != 200: return []
             d = json.loads(body)
             if d.get("status") != "ok":
                 logging.warning(f"Axionna: status={d.get('status')}")
                 return []
-
-            sponsors = d.get("sponsors", [])
             out = []
-            for x in sponsors:
+            for x in d.get("sponsors", []):
                 link = x.get("link")
                 task_id = x.get("id")
                 if link and task_id:
@@ -88,18 +86,12 @@ async def check_axionna(user_id, task_ids):
                      "Content-Type": "application/json"}) as r:
             body = await r.text()
             logging.info(f"AXIONNA /check: status={r.status}, body={body[:500]}")
-
-            if r.status != 200:
-                return {}
-
+            if r.status != 200: return {}
             d = json.loads(body)
-            if d.get("status") != "ok":
-                return {}
-
+            if d.get("status") != "ok": return {}
             res = {}
             for x in d.get("results", []):
                 tid = str(x.get("id"))
-                # Засчитываем ТОЛЬКО если subscribed И credited
                 ok = bool(x.get("subscribed")) and bool(x.get("credited"))
                 res[tid] = {
                     "ok": ok,
@@ -133,19 +125,14 @@ async def fetch_darkboost(user_id, username="", first_name=""):
             headers={"Auth": DARKBOOST_API_KEY, "Content-Type": "application/json"}) as r:
             body = await r.text()
             logging.info(f"DARKBOOST /sponsors: status={r.status}, body={body[:500]}")
-
-            if r.status != 200:
-                return []
-
+            if r.status != 200: return []
             d = json.loads(body)
             if not (d.get("ok") and d.get("status") == "ok"):
                 logging.warning(f"DarkBoost: ok={d.get('ok')}, status={d.get('status')}")
                 return []
-
             session_id = d.get("session_id")
-            sponsors = d.get("sponsors", [])
             out = []
-            for x in sponsors:
+            for x in d.get("sponsors", []):
                 link = x.get("link")
                 task_id = x.get("id")
                 if link:
@@ -155,7 +142,7 @@ async def fetch_darkboost(user_id, username="", first_name=""):
                         "link": link,
                         "session_id": session_id,
                     })
-            logging.info(f"DarkBoost: получено {len(out)} заданий, session_id={session_id}")
+            logging.info(f"DarkBoost: {len(out)} заданий, session_id={session_id}")
             return out
     except Exception as e:
         logging.error(f"DarkBoost fetch: {e}")
@@ -171,18 +158,68 @@ async def check_darkboost(user_id, session_id):
             headers={"Auth": DARKBOOST_API_KEY, "Content-Type": "application/json"}) as r:
             body = await r.text()
             logging.info(f"DARKBOOST /check: status={r.status}, body={body[:500]}")
-
-            if r.status != 200:
-                return {}
-
+            if r.status != 200: return {}
             d = json.loads(body)
-            if d.get("status") == "ok":
-                return {"ok": True, "raw": d}
-            else:
-                return {"ok": False, "raw": d}
+            return d
     except Exception as e:
         logging.error(f"DarkBoost check: {e}")
     return {}
+
+
+# ═══════════════════════════════════════════════
+# WEBHOOK DARKBOOST
+# ═══════════════════════════════════════════════
+
+async def darkboost_webhook(request):
+    """Принимает вебхуки от DarkBoost: subscription / unsubscription."""
+    try:
+        body = await request.read()
+        sig = request.headers.get("X-DarkBoost-Signature", "")
+        event_type = request.headers.get("X-DarkBoost-Event", "")
+        event_id = request.headers.get("X-DarkBoost-Event-Id", "")
+
+        logging.info(f"DarkBoost webhook: event={event_type}, id={event_id}")
+        logging.info(f"DarkBoost webhook body: {body[:500]}")
+
+        # Проверка подписи HMAC-SHA256
+        if DARKBOOST_WEBHOOK_SECRET:
+            expected = "sha256=" + hmac.new(
+                DARKBOOST_WEBHOOK_SECRET.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not hmac.compare_digest(sig, expected):
+                logging.error(f"DarkBoost webhook: bad signature. got={sig[:20]}..., expected={expected[:20]}...")
+                return web.Response(status=403, text="bad signature")
+            logging.info("DarkBoost webhook: signature OK")
+        else:
+            logging.warning("DarkBoost webhook: DARKBOOST_WEBHOOK_SECRET не задан, подпись не проверяется")
+
+        try:
+            event = json.loads(body)
+        except Exception:
+            event = {}
+
+        logging.info(f"DarkBoost payload: {event}")
+
+        user_id = event.get("user_id") or event.get("tg_user_id")
+        service = event.get("service", "darkboost")
+
+        if event_type == "subscription" and user_id:
+            logging.info(f"✅ DarkBoost: SUBSCRIPTION для {user_id} (service={service})")
+            # В тестовом боте — просто логируем
+
+        elif event_type == "unsubscription" and user_id:
+            logging.info(f"❌ DarkBoost: UNSUBSCRIPTION для {user_id} (service={service})")
+
+        return web.Response(status=200, text="ok")
+
+    except Exception as e:
+        logging.error(f"DarkBoost webhook error: {e}")
+        return web.Response(status=200, text="ok")
+
+
+async def darkboost_health(request):
+    """GET-проверка, что эндпоинт живой."""
+    return web.Response(text="darkboost webhook alive")
 
 
 # ═══════════════════════════════════════════════
@@ -197,7 +234,7 @@ def sponsors_kb(tasks):
             label += f" · {t['task']}"
         kb.button(text=label, url=t["link"])
     kb.button(text="✅ Проверить подписки", callback_data="check")
-    rows = [1] * len(tasks)  # по одному в ряд для теста (видно сервис)
+    rows = [1] * len(tasks)
     rows.append(1)
     kb.adjust(*rows)
     return kb.as_markup()
@@ -215,26 +252,23 @@ async def cmd_start(msg: types.Message):
 
     logging.info(f"=== /start from {uid} (@{un}) ===")
 
-    # Параллельно
     axionna_tasks, darkboost_tasks = await asyncio.gather(
         fetch_axionna(uid),
         fetch_darkboost(uid, un, fn),
-        return_exceptions=False,
     )
 
     all_tasks = axionna_tasks + darkboost_tasks
     _user_tasks[uid] = all_tasks
 
-    logging.info(f"Всего задач: {len(all_tasks)} | Axionna: {len(axionna_tasks)} | DarkBoost: {len(darkboost_tasks)}")
+    logging.info(f"Всего: {len(all_tasks)} | Axionna: {len(axionna_tasks)} | DarkBoost: {len(darkboost_tasks)}")
 
     if not all_tasks:
         await msg.answer(
             "😕 <b>Спонсоров нет.</b>\n\n"
-            "Возможно:\n"
-            "• Ключ Axionna / DarkBoost не задан\n"
-            "• Нет активных офферов для тебя\n"
+            "• Ключ не задан\n"
+            "• Нет офферов\n"
             "• API вернул ошибку\n\n"
-            "Смотри <b>логи BotHost</b> — там видно ответ каждого сервиса."
+            "Смотри логи BotHost."
         )
         return
 
@@ -252,7 +286,7 @@ async def cb_check(cq: types.CallbackQuery):
     uid = cq.from_user.id
     tasks = _user_tasks.get(uid, [])
     if not tasks:
-        await cq.answer("Задачи устарели. Напиши /start заново.", show_alert=True)
+        await cq.answer("Задачи устарели. /start заново.", show_alert=True)
         return
 
     await cq.answer("Проверяю…")
@@ -267,7 +301,6 @@ async def cb_check(cq: types.CallbackQuery):
         report += "<b>AXIONNA</b>\n"
         ids = [t["id"] for t in axionna_tasks]
         res = await check_axionna(uid, ids)
-
         done = 0
         for t in axionna_tasks:
             info = res.get(t["id"])
@@ -288,22 +321,29 @@ async def cb_check(cq: types.CallbackQuery):
     # ─── DARKBOOST ───
     if darkboost_tasks:
         report += "<b>DARKBOOST</b>\n"
-        # Берём session_id из первой задачи (у всех одинаковый)
         session_id = darkboost_tasks[0].get("session_id")
-        res = await check_darkboost(uid, session_id)
+        raw = await check_darkboost(uid, session_id)
 
-        if res.get("ok"):
+        status = raw.get("status")
+        missing = raw.get("missing", [])
+
+        if status == "ok":
             report += f"• Все задачи: ✅ подтверждены\n"
             report += f"• Итого: <b>{len(darkboost_tasks)}/{len(darkboost_tasks)}</b>\n"
+        elif status == "cooldown":
+            report += f"• ⏳ cooldown, попробуй позже\n"
+        elif status == "not_found":
+            report += f"• ❌ сессия не найдена, /start заново\n"
+        elif status == "no_offers":
+            report += f"• ❌ нет офферов\n"
         else:
-            raw = res.get("raw", {})
-            report += f"• Все задачи: ❌ не подтверждены\n"
-            report += f"• Ответ API: <code>{json.dumps(raw, ensure_ascii=False)[:200]}</code>\n"
-            report += f"• Итого: <b>0/{len(darkboost_tasks)}</b>\n"
+            report += f"• ❌ status={status}\n"
+            report += f"• missing: <b>{len(missing)}</b>\n"
 
-        report += f"• session_id: <code>{session_id}</code>\n\n"
+        report += f"• session_id: <code>{session_id}</code>\n"
+        report += f"• raw: <code>{json.dumps(raw, ensure_ascii=False)[:200]}</code>\n\n"
 
-    report += "<i>Детали смотри в логах BotHost.</i>"
+    report += "<i>Детали — в логах BotHost.</i>"
 
     try:
         await cq.message.edit_text(report)
@@ -314,28 +354,53 @@ async def cb_check(cq: types.CallbackQuery):
 @dp.message(Command("admin"))
 async def cmd_admin(msg: types.Message):
     if msg.from_user.id != ADMIN_ID: return
-    text = "🔑 <b>Ключи сервисов:</b>\n\n"
+    text = "🔑 <b>Ключи:</b>\n\n"
     text += f"{'✅' if AXIONNA_API_KEY else '❌'} Axionna\n"
-    text += f"{'✅' if DARKBOOST_API_KEY else '❌'} DarkBoost\n"
-    text += "\n<i>Добавь ключ в BotHost → Переменные окружения → перезапусти бота.</i>"
+    text += f"{'✅' if DARKBOOST_API_KEY else '❌'} DarkBoost API\n"
+    text += f"{'✅' if DARKBOOST_WEBHOOK_SECRET else '❌'} DarkBoost Webhook Secret\n"
     await msg.answer(text)
 
 
+@dp.message(Command("webhook_test"))
+async def cmd_webhook_test(msg: types.Message):
+    if msg.from_user.id != ADMIN_ID: return
+    await msg.answer(
+        f"🔗 URL вебхука:\n"
+        f"<code>https://{os.getenv('SELF_URL', 'твой-домен.bothost.tech')}/darkboost/webhook</code>\n\n"
+        f"Проверь его в браузере — должно быть <b>darkboost webhook alive</b>"
+    )
+
+
 # ═══════════════════════════════════════════════
-# ВЕБ + MAIN
+# WEB + MAIN
 # ═══════════════════════════════════════════════
 
 async def health(_):
     return web.Response(text="ok")
 
 
-async def main():
+async def start_web():
     app = web.Application()
     app.router.add_get("/", health)
+    app.router.add_post("/darkboost/webhook", darkboost_webhook)
+    app.router.add_get("/darkboost/webhook", darkboost_health)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     logging.info(f"Web on :{PORT}")
+    logging.info(f"Webhook endpoint: /darkboost/webhook")
+
+
+async def on_shutdown(*args, **kwargs):
+    global _http
+    if _http and not _http.closed:
+        await _http.close()
+        logging.info("HTTP session closed")
+
+
+async def main():
+    await start_web()
+    dp.shutdown.register(on_shutdown)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
